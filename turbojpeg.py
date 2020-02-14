@@ -80,6 +80,27 @@ TJSAMP_GRAY = 3
 TJSAMP_440 = 4
 TJSAMP_411 = 5
 
+# transform operations
+# see details in https://github.com/libjpeg-turbo/libjpeg-turbo/blob/master/turbojpeg.h
+TJXOP_NONE = 0
+TJXOP_HFLIP = 1
+TJXOP_VFLIP = 2
+TJXOP_TRANSPOSE = 3
+TJXOP_TRANSVERSE = 4
+TJXOP_ROT90 = 5
+TJXOP_ROT180 = 6
+TJXOP_ROT270 = 7
+
+# transform options
+# see details in https://github.com/libjpeg-turbo/libjpeg-turbo/blob/master/turbojpeg.h
+TJXOPT_PERFECT = 1
+TJXOPT_TRIM = 2
+TJXOPT_CROP = 4
+TJXOPT_GRAY = 8
+TJXOPT_NOOUTPUT = 16
+TJXOPT_PROGRESSIVE = 32
+TJXOPT_COPYNONE = 64
+
 # miscellaneous flags
 # see details in https://github.com/libjpeg-turbo/libjpeg-turbo/blob/master/turbojpeg.h
 # note: TJFLAG_NOREALLOC cannot be supported due to reallocation is needed by PyTurboJPEG.
@@ -90,6 +111,13 @@ TJFLAG_ACCURATEDCT = 4096
 TJFLAG_STOPONWARNING = 8192
 TJFLAG_PROGRESSIVE = 16384
 
+class CroppingRegion(Structure):
+    _fields_ = [("x", c_int), ("y", c_int), ("w", c_int), ("h", c_int)]
+
+class TransformStruct(Structure):
+    _fields_ = [("r", CroppingRegion), ("op", c_int), ("options", c_int),
+        ("data", c_void_p), ("customFilter", c_int)]
+
 class TurboJPEG(object):
     """A Python wrapper of libjpeg-turbo for decoding and encoding JPEG image."""
     def __init__(self, lib_path=None):
@@ -97,6 +125,9 @@ class TurboJPEG(object):
             self.__find_turbojpeg() if lib_path is None else lib_path)
         self.__init_decompress = turbo_jpeg.tjInitDecompress
         self.__init_decompress.restype = c_void_p
+        self.__buffer_size = turbo_jpeg.tjBufSize
+        self.__buffer_size.argtypes = [c_int, c_int, c_int]
+        self.__buffer_size.restype = c_ulong
         self.__init_compress = turbo_jpeg.tjInitCompress
         self.__init_compress.restype = c_void_p
         self.__buffer_size_YUV2 = turbo_jpeg.tjBufSizeYUV2
@@ -130,6 +161,12 @@ class TurboJPEG(object):
             c_void_p, POINTER(c_ubyte), c_int, c_int, c_int, c_int, POINTER(c_void_p),
             POINTER(c_ulong), c_int, c_int]
         self.__compressFromYUV.restype = c_int
+        self.__init_transform = turbo_jpeg.tjInitTransform
+        self.__init_transform.restype = c_void_p
+        self.__transform = turbo_jpeg.tjTransform
+        self.__transform.argtypes = [c_void_p, POINTER(c_ubyte), c_ulong, c_int,
+            POINTER(c_void_p), POINTER(c_ulong), POINTER(TransformStruct), c_int]
+        self.__transform.restype = c_int
         self.__free = turbo_jpeg.tjFree
         self.__free.argtypes = [c_void_p]
         self.__free.restype = None
@@ -220,12 +257,6 @@ class TurboJPEG(object):
         finally:
             self.__destroy(handle)
 
-    """
-    @jpeg_buf           buffer containing jpeg image bytes
-    @scaling_factor     optional image scaling
-    @quality            optional image quality to be reencoded with
-    @flags
-    """
     def scale_with_quality(self, jpeg_buf, scaling_factor=None, quality=85, flags=0):
         """decompresstoYUV with scale factor, recompresstoYUV with quality factor"""
         handle = self.__init_decompress()
@@ -260,7 +291,63 @@ class TurboJPEG(object):
         finally:
             self.__destroy(handle)
 
+    def crop(self, jpeg_buf, x, y, w, h, gray=False):
+        """losslessly crop a jpeg image with optional grayscale"""
+        handle = self.__init_transform()
+        try:
+            jpeg_array = np.frombuffer(jpeg_buf, dtype=np.uint8)
+            src_addr = self.__getaddr(jpeg_array)
+            width = c_int()
+            height = c_int()
+            jpeg_colorspace = c_int()
+            jpeg_subsample = c_int()
+            status = self.__decompress_header(
+                handle, src_addr, jpeg_array.size, byref(width), byref(height),
+                byref(jpeg_subsample), byref(jpeg_colorspace))
+            if status != 0:
+                self.__report_error(handle)
+            if x < 0:
+                x = 0
+            else:
+                x = (x / 16) * 16
+            if y < 0:
+                y = 0
+            else:
+                y = (y / 16) * 16
+            if w < 0:
+                w = 0
+            if h < 0:
+                h = 0
+            if width.value < (w + x):
+                w = width.value - x
+            if width.value < x:
+                x = width.value
+            if height.value < (h + y):
+                h = height.value - y
+            if height.value < y:
+                y = height.value
+            dest_array = c_void_p()
+            dest_size = c_ulong()
+            region = CroppingRegion(x,y,w,h)
+            crop_transform = TransformStruct()
+            crop_transform.r = region
+            crop_transform.op = TJXOP_NONE
+            crop_transform.options = TJXOPT_CROP | (gray and TJXOPT_GRAY)
+            status = self.__transform(
+                handle, src_addr, jpeg_array.size, 1, byref(dest_array), byref(dest_size),
+                byref(crop_transform), 0)
+            dest_buf = create_string_buffer(dest_size.value)
+            memmove(dest_buf, dest_array.value, dest_size.value)
+            self.__free(dest_array)
+            if status != 0:
+                self.__report_error(handle)
+                return
+            return dest_buf
+        finally:
+            self.__destroy(handle)
+
     def __get_header_and_dimensions(self, handle, jpeg_array_size, src_addr, scaling_factor):
+        """returns scaled image dimensions and header data"""
         if scaling_factor is not None and \
             scaling_factor not in self.__scaling_factors:
             raise ValueError('supported scaling factors are ' +
@@ -327,12 +414,12 @@ class TurboJPEG(object):
 
 if __name__ == '__main__':
     jpeg = TurboJPEG()
-
     in_file = open('input.jpg', 'rb')
-    img_array = jpeg.decode(in_file.read())
+    img_array = jpeg.crop(in_file.read(), 1000, 1000, 1000, 1000)
+    #img_array = jpeg.decode(in_file.read())
     in_file.close()
-    out_file = open('output5.jpg', 'wb')
-    out_file.write(jpeg.encode(img_array))
+    out_file = open('output.jpg', 'wb')
+    out_file.write(img_array)
     out_file.close()
     """
     import cv2
