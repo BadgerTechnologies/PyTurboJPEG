@@ -282,6 +282,29 @@ class TurboJPEG(object):
         finally:
             self.__destroy(handle)
 
+    def transform(self, jpeg_buf, operation):
+        """losslessly transform a jpeg image. e.g. TJXOP_ROT90"""
+        handle = self.__init_transform()
+        try:
+            jpeg_array = np.frombuffer(jpeg_buf, dtype=np.uint8)
+            src_addr = self.__getaddr(jpeg_array)
+            dest_array = c_void_p()
+            dest_size = c_ulong()
+            region = CroppingRegion(0,0,0,0)
+            transform = TransformStruct(region, operation, 0)
+
+            status = self.__transform(
+                handle, src_addr, jpeg_array.size, 1, byref(dest_array), byref(dest_size),
+                byref(transform), 0)
+            dest_buf = create_string_buffer(dest_size.value)
+            memmove(dest_buf, dest_array.value, dest_size.value)
+            self.__free(dest_array)
+            if status != 0:
+                self.__report_error(handle)
+            return dest_buf.raw
+        finally:
+            self.__destroy(handle)
+
     def scale_with_quality(self, jpeg_buf, scaling_factor=None, quality=85, flags=0):
         """decompresstoYUV with scale factor, recompresstoYUV with quality factor"""
         handle = self.__init_decompress()
